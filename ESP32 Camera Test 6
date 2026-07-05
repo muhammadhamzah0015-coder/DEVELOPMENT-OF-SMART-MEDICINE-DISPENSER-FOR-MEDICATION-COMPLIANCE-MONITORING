@@ -1,0 +1,573 @@
+/* Includes ---------------------------------------------------------------- */
+#include <YOUR EDGE IMPULSE Inferencing.h>
+#include "edge-impulse-sdk/dsp/image/image.hpp"
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <esp_now.h> 
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+
+// ===== OLED INCLUDES & SETTINGS =====
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SCREEN_WIDTH 128 
+#define SCREEN_HEIGHT 64 
+// Using Pins 14 and 15 for I2C since SD Card is not used
+#define I2C_SDA 14
+#define I2C_SCL 15
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+String lastOledText = ""; 
+unsigned long sleepOledTimer = 0;
+bool oledIsShowingSleep = false;
+// ====================================
+
+// ===== WIFI SETTINGS =====
+const char* ssid = "";
+const char* password = "";
+
+// ===== TELEGRAM API SETTINGS =====
+String TELEGRAM_BOT_TOKEN = "8071110210:AAHya3vC7XQlzNKduBTdt28mTYRMQnWE21s";
+String TELEGRAM_CHAT_ID = "1081516566";
+
+// ===== ESP-NOW MAC ADDRESSES =====
+uint8_t aiAssistantAddress[] = {0xAC, 0xA7, 0x04, 0x26, 0x0B, 0xE0}; 
+
+// ===== EVENT COUNTERS & FLAGS =====
+int presence_count = 0;
+int consumed_count = 0;
+int unknown_count = 0;
+
+bool presence_command_sent = false;
+bool consumed_command_sent = false;
+bool unknown_3_command_sent = false;
+
+unsigned long last_image_time = 0;
+const unsigned long IMAGE_COOLDOWN_MS = 1000; 
+
+// ===== SERVER & DASHBOARD =====
+WiFiServer webServer(80);
+String latest_detection = "Camera Sleeping";
+bool camera_is_on = false; 
+
+typedef struct struct_message {
+  bool isPresent;
+} struct_message;
+struct_message incomingData;
+
+typedef struct text_message {
+  char commandText[200];
+} text_message;
+text_message outgoingCommand;
+
+esp_now_peer_info_t peerInfo;
+
+// ===== HTML DASHBOARD PAGE =====
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Smart Medicine Dispenser</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: Arial, sans-serif; text-align: center; background: #121212; color: #ffffff; padding-top: 20px;}
+    h2 { color: #00ffcc; }
+    .video-container { position: relative; display: inline-block; border: 4px solid #333; border-radius: 10px; overflow: hidden; width: 90%; max-width: 640px;}
+    img { width: 100%; display: block; background: #222; min-height: 240px; }
+    .overlay { position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.8); 
+               color: #00ffcc; padding: 8px 15px; font-size: 16px; font-weight: bold; border-radius: 8px; width: 80%; text-align: center;}
+  </style>
+</head>
+<body>
+  <h2>FYP Camera Stream</h2>
+  <div class="video-container">
+    <div class="overlay" id="ai-result">Loading...</div>
+  </div>
+  <script>
+    setInterval(function() {
+      fetch('/result')
+        .then(response => response.text())
+        .then(text => {
+          document.getElementById('ai-result').innerText = text;
+          if(text === "Scanning...") document.getElementById('ai-result').style.color = "#ff4444";
+          else if(text.includes("Sleeping")) document.getElementById('ai-result').style.color = "#888888";
+          else document.getElementById('ai-result').style.color = "#00ffcc";
+        });
+    }, 500);
+  </script>
+</body>
+</html>
+)rawliteral";
+
+#define CAMERA_MODEL_AI_THINKER 
+
+#if defined(CAMERA_MODEL_AI_THINKER)
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+#else
+#error "Camera model not selected"
+#endif
+
+#define EI_CAMERA_RAW_FRAME_BUFFER_COLS           320
+#define EI_CAMERA_RAW_FRAME_BUFFER_ROWS           240
+#define EI_CAMERA_FRAME_BYTE_SIZE                 3
+
+#define FLASH_LED_PIN 4
+
+static bool debug_nn = false;
+static bool is_initialised = false;
+uint8_t *snapshot_buf; 
+
+static camera_config_t camera_config = {
+    .pin_pwdn = PWDN_GPIO_NUM,  .pin_reset = RESET_GPIO_NUM, .pin_xclk = XCLK_GPIO_NUM,
+    .pin_sscb_sda = SIOD_GPIO_NUM, .pin_sscb_scl = SIOC_GPIO_NUM,
+    .pin_d7 = Y9_GPIO_NUM, .pin_d6 = Y8_GPIO_NUM, .pin_d5 = Y7_GPIO_NUM, .pin_d4 = Y6_GPIO_NUM,
+    .pin_d3 = Y5_GPIO_NUM, .pin_d2 = Y4_GPIO_NUM, .pin_d1 = Y3_GPIO_NUM, .pin_d0 = Y2_GPIO_NUM,
+    .pin_vsync = VSYNC_GPIO_NUM, .pin_href = HREF_GPIO_NUM, .pin_pclk = PCLK_GPIO_NUM,
+    .xclk_freq_hz = 20000000,
+    .ledc_timer = LEDC_TIMER_0, .ledc_channel = LEDC_CHANNEL_0,
+    .pixel_format = PIXFORMAT_JPEG,
+    .frame_size = FRAMESIZE_QVGA, 
+    .jpeg_quality = 10,
+    .fb_count = 1,
+    .fb_location = CAMERA_FB_IN_PSRAM,
+    .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
+};
+
+bool ei_camera_init(void);
+void ei_camera_deinit(void);
+bool ei_camera_capture(uint32_t img_width, uint32_t img_height, uint8_t *out_buf);
+static int ei_camera_get_data(size_t offset, size_t length, float *out_ptr); 
+
+// ==============================================================
+// OLED HELPER FUNCTION (Memory Safe)
+// ==============================================================
+void updateOLED(String text) {
+  // Only redraw if the text actually changed to save CPU time!
+  if (text != lastOledText) {
+    display.clearDisplay();
+    display.setCursor(0, 10);
+    display.print(text);
+    display.display();
+    lastOledText = text;
+  }
+}
+
+// ==============================================================
+// ESP-NOW SENDER & RECEIVER FUNCTIONS
+// ==============================================================
+void sendCommandToAI(String cmd) {
+  cmd.toCharArray(outgoingCommand.commandText, sizeof(outgoingCommand.commandText));
+  esp_now_send(aiAssistantAddress, (uint8_t *) &outgoingCommand, sizeof(outgoingCommand));
+  Serial.println("[ESP-NOW] Sent to AI: " + cmd);
+}
+
+void OnDataSent(const esp_now_send_info_t *info, esp_now_send_status_t status) { }
+
+void OnDataRecv(const uint8_t * mac, const uint8_t *incomingDataBytes, int len) {
+  memcpy(&incomingData, incomingDataBytes, sizeof(incomingData));
+  
+  if (incomingData.isPresent == true && camera_is_on == false) {
+    Serial.println("\n[ESP-NOW] Ultrasonic detected patient: WAKING UP CAMERA");
+    if (ei_camera_init()) {
+      camera_is_on = true;
+      analogWrite(FLASH_LED_PIN, 1);
+      latest_detection = "Scanning...";
+      
+      // OLED Wake up Update
+      oledIsShowingSleep = false;
+      updateOLED("Waking Up...\nScanning...");
+      
+      presence_count = 0;
+      consumed_count = 0;
+      unknown_count = 0;
+      presence_command_sent = false;
+      consumed_command_sent = false;
+      unknown_3_command_sent = false;
+    }
+  } 
+}
+
+void sendTelegramText(String message) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    WiFiClientSecure client;
+    client.setInsecure(); 
+    String url = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/sendMessage";
+    http.begin(client, url);
+    http.addHeader("Content-Type", "application/json");
+    String jsonPayload = "{\"chat_id\":\"" + TELEGRAM_CHAT_ID + "\",\"text\":\"" + message + "\"}";
+    http.POST(jsonPayload);
+    http.end();
+  }
+}
+
+void takeAndSendTelegramImage() {
+  Serial.println("Capturing high quality image for Telegram visual proof...");
+  
+  sensor_t * s = esp_camera_sensor_get();
+  s->set_framesize(s, FRAMESIZE_VGA);
+  
+  camera_fb_t * fb = esp_camera_fb_get(); 
+  if (fb) esp_camera_fb_return(fb); 
+  delay(200);
+  
+  fb = esp_camera_fb_get(); 
+  if (fb) esp_camera_fb_return(fb);
+  delay(200);
+
+  fb = esp_camera_fb_get();  
+  
+  if (!fb) {
+    Serial.println("Camera capture failed");
+    s->set_framesize(s, FRAMESIZE_QVGA);
+    return;
+  }
+  
+  WiFiClientSecure client_tcp;
+  client_tcp.setInsecure(); 
+  const char* myDomain = "api.telegram.org";
+  
+  if (client_tcp.connect(myDomain, 443)) {
+    Serial.println("Uploading image to Telegram...");
+    
+    String head = "--India\r\nContent-Disposition: form-data; name=\"chat_id\"; \r\n\r\n" + TELEGRAM_CHAT_ID + "\r\n--India\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"esp32-cam.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n";
+    String tail = "\r\n--India--\r\n";
+
+    uint16_t imageLen = fb->len;
+    uint16_t extraLen = head.length() + tail.length();
+    uint16_t totalLen = imageLen + extraLen;
+  
+    client_tcp.println("POST /bot" + TELEGRAM_BOT_TOKEN + "/sendPhoto HTTP/1.1");
+    client_tcp.println("Host: " + String(myDomain));
+    client_tcp.println("Content-Length: " + String(totalLen));
+    client_tcp.println("Content-Type: multipart/form-data; boundary=India");
+    client_tcp.println();
+    client_tcp.print(head);
+  
+    uint8_t *fbBuf = fb->buf;
+    size_t fbLen = fb->len;
+
+    for (size_t n=0;n<fbLen;n=n+1024) {
+      if (n+1024<fbLen) {
+        client_tcp.write(fbBuf, 1024);
+        fbBuf += 1024;
+      }
+      else if (fbLen%1024>0) {
+        size_t remainder = fbLen%1024;
+        client_tcp.write(fbBuf, remainder);
+      }
+    }  
+    
+    client_tcp.print(tail);
+    client_tcp.stop();
+    Serial.println("Telegram Image Sent Successfully!");
+  } else {
+    Serial.println("Connection to Telegram failed.");
+  }
+  
+  esp_camera_fb_return(fb); 
+  s->set_framesize(s, FRAMESIZE_QVGA);
+}
+
+
+void setup() {
+    Serial.begin(115200);
+
+    pinMode(FLASH_LED_PIN, OUTPUT);
+    digitalWrite(FLASH_LED_PIN, LOW); 
+
+    // ===== INIT OLED DISPLAY =====
+    // ===== INIT OLED DISPLAY =====
+    Wire.begin(I2C_SDA, I2C_SCL);
+    if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
+      Serial.println(F("SSD1306 allocation failed"));
+    } else {
+      display.clearDisplay();
+      
+      // Add this line to flip the screen upside down (180 degrees)
+      display.setRotation(2); 
+      
+      display.setTextSize(2); // Large text for easy reading
+      display.setTextColor(SSD1306_WHITE);
+      display.setCursor(0, 10);
+      display.println("Wifi...");
+      display.display();
+    }
+    // =============================
+
+    while (!Serial);
+
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+    Serial.print("Connecting to WiFi");
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("\nWiFi connected");
+    updateOLED("WiFi OK");
+
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("Error initializing ESP-NOW");
+    } else {
+        esp_now_register_recv_cb(esp_now_recv_cb_t(OnDataRecv));
+        esp_now_register_send_cb(OnDataSent);
+        
+        memcpy(peerInfo.peer_addr, aiAssistantAddress, 6);
+        peerInfo.channel = 0;  
+        peerInfo.encrypt = false;
+        if (esp_now_add_peer(&peerInfo) != ESP_OK){
+          Serial.println("Failed to add AI Assistant peer");
+        }
+        
+        Serial.println("ESP-NOW Ready. Waiting for wake signal...");
+    }
+
+    webServer.begin();
+    
+    Serial.println("\n=================================");
+    Serial.print("DASHBOARD READY! Go to: http://");
+    Serial.println(WiFi.localIP());
+    Serial.println("=================================\n");
+
+    // Turn screen off initially since camera starts asleep
+    display.clearDisplay();
+    display.display();
+}
+
+void loop() {
+    // 1. NON-BLOCKING OLED SLEEP TIMER
+    // Clears the screen exactly 5 seconds after the camera goes to sleep
+    if (oledIsShowingSleep && (millis() - sleepOledTimer > 5000)) {
+        display.clearDisplay();
+        display.display();
+        oledIsShowingSleep = false;
+        lastOledText = ""; // Reset buffer
+    }
+
+    // 2. HANDLE WEB DASHBOARD (PORT 80)
+    WiFiClient webClient = webServer.available();
+    if (webClient) {
+        String request = webClient.readStringUntil('\r');
+        webClient.flush();
+        
+        if (request.indexOf("GET /result") != -1) {
+            webClient.println("HTTP/1.1 200 OK");
+            webClient.println("Content-Type: text/plain");
+            webClient.println("Access-Control-Allow-Origin: *");
+            webClient.println();
+            webClient.print(latest_detection);
+        } else {
+            webClient.println("HTTP/1.1 200 OK");
+            webClient.println("Content-Type: text/html");
+            webClient.println();
+            webClient.print(INDEX_HTML);
+        }
+        webClient.stop();
+    }
+
+    // 3. RUN AI MODEL (ONLY IF WOKEN UP BY SENSOR)
+    if (camera_is_on) {
+        if (ei_sleep(5) != EI_IMPULSE_OK) return;
+
+        snapshot_buf = (uint8_t*)malloc(EI_CAMERA_RAW_FRAME_BUFFER_COLS * EI_CAMERA_RAW_FRAME_BUFFER_ROWS * EI_CAMERA_FRAME_BYTE_SIZE);
+        if(snapshot_buf == nullptr) return;
+
+        ei::signal_t signal;
+        signal.total_length = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
+        signal.get_data = &ei_camera_get_data;
+
+        if (ei_camera_capture((size_t)EI_CLASSIFIER_INPUT_WIDTH, (size_t)EI_CLASSIFIER_INPUT_HEIGHT, snapshot_buf) == false) {
+            free(snapshot_buf);
+            return;
+        }
+
+        ei_impulse_result_t result = { 0 };
+        EI_IMPULSE_ERROR err = run_classifier(&signal, &result, debug_nn);
+        if (err != EI_IMPULSE_OK) {
+            free(snapshot_buf);
+            return;
+        }
+
+        bool found_something = false;
+        String detected_label = "unknown";
+        float highest_confidence = 0.0;
+        int best_index = -1;
+
+#if EI_CLASSIFIER_OBJECT_DETECTION == 1
+        for (uint32_t i = 0; i < result.bounding_boxes_count; i++) {
+            ei_impulse_result_bounding_box_t bb = result.bounding_boxes[i];
+            if (bb.value >= 0.60) { 
+                detected_label = String(bb.label);
+                highest_confidence = bb.value;
+                latest_detection = detected_label + " (" + String((int)(highest_confidence * 100)) + "%)";
+                found_something = true;
+                break; 
+            }
+        }
+#else
+        for (uint16_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+            if (result.classification[i].value > highest_confidence) {
+                highest_confidence = result.classification[i].value;
+                best_index = i;
+            }
+        }
+        
+        if (highest_confidence >= 0.60 && best_index != -1) { 
+            detected_label = String(ei_classifier_inferencing_categories[best_index]);
+            latest_detection = detected_label + " (" + String((int)(highest_confidence * 100)) + "%)";
+            found_something = true;
+        }
+#endif
+
+        detected_label.toLowerCase();
+
+        // ==========================================
+        // NEW LOGIC & COUNTER SYSTEM
+        // ==========================================
+
+        if (detected_label.indexOf("presence") != -1) {
+            unknown_count = 0;
+            presence_count++;
+            
+            updateOLED("Presence\nFound"); // Update screen
+            
+            if (presence_count >= 2 && presence_command_sent == false) {
+                sendCommandToAI("Command: Patient presence for medication.");
+                sendTelegramText("ℹ️ Patient is present for medicine."); 
+                presence_command_sent = true; 
+            }
+            Serial.println(">>> " + latest_detection); 
+        } 
+        
+        else if (detected_label.indexOf("consumed") != -1) {
+            unknown_count = 0;
+            consumed_count++;
+
+            updateOLED("Medicine\nConsumed"); // Update screen
+            
+            if (consumed_count == 1 && consumed_command_sent == false) {
+                
+                // 1. Silently send the photo to Telegram as visual proof
+                takeAndSendTelegramImage();
+                
+                // 2. Tell the AI Assistant to start the verbal confirmation loop. 
+                // The AI Assistant will check its own memory to see if the button was pressed.
+                sendCommandToAI("System Alert: The camera saw Abdullah pick up the pill. Ask him gently for confirmation: 'I saw you pick up the pill, did you swallow it?'");
+                
+                consumed_command_sent = true;
+                last_image_time = millis();
+            }
+            else if (consumed_count > 1 && consumed_command_sent == true) {
+                if (millis() - last_image_time > IMAGE_COOLDOWN_MS) {
+                    takeAndSendTelegramImage();
+                    last_image_time = millis(); 
+                }
+            }
+            Serial.println(">>> " + latest_detection); 
+        } 
+        
+        else {
+            unknown_count++;
+            latest_detection = "Scanning... (Unknown: " + String(unknown_count) + "/15)";
+            Serial.println(latest_detection);
+
+            updateOLED("Scanning\n" + String(unknown_count) + "/15"); // Update screen
+
+            if (presence_count > 0 && unknown_count == 3 && unknown_3_command_sent == false) {
+                sendCommandToAI("Command: The patient left the presence, he walked away, call him to take medicine if now is the time for medicine.");
+                unknown_3_command_sent = true;
+            }
+
+            if (unknown_count >= 15) {
+                Serial.println("\n[SYSTEM] 15 Unknowns detected. Shutting down system.");
+                Serial.flush();
+                
+                sendCommandToAI("SLEEP_ALL"); 
+                ei_camera_deinit();
+                camera_is_on = false;
+                analogWrite(FLASH_LED_PIN, 0);
+                latest_detection = "Camera Sleeping (Auto-Off)";
+
+                // Trigger OLED Sleep Mode
+                updateOLED("System\nSleeping");
+                oledIsShowingSleep = true;
+                sleepOledTimer = millis(); 
+                
+                presence_count = 0;
+                consumed_count = 0;
+                unknown_count = 0;
+                presence_command_sent = false;
+                consumed_command_sent = false;
+                unknown_3_command_sent = false;
+            }
+        }
+
+        free(snapshot_buf);
+    }
+}
+
+// ==============================================================
+// CAMERA HARDWARE FUNCTIONS 
+// ==============================================================
+bool ei_camera_init(void) {
+    if (is_initialised) return true;
+    esp_err_t err = esp_camera_init(&camera_config);
+    if (err != ESP_OK) return false;
+    sensor_t * s = esp_camera_sensor_get();
+    if (s->id.PID == OV3660_PID) {
+      s->set_vflip(s, 1); s->set_brightness(s, 1); s->set_saturation(s, 0);
+    }
+    is_initialised = true;
+    return true;
+}
+
+void ei_camera_deinit(void) {
+    esp_camera_deinit();
+    is_initialised = false;
+}
+
+bool ei_camera_capture(uint32_t img_width, uint32_t img_height, uint8_t *out_buf) {
+    bool do_resize = false;
+    if (!is_initialised) return false;
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) return false;
+
+   bool converted = fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, snapshot_buf);
+   esp_camera_fb_return(fb);
+   if(!converted) return false;
+
+    if ((img_width != EI_CAMERA_RAW_FRAME_BUFFER_COLS) || (img_height != EI_CAMERA_RAW_FRAME_BUFFER_ROWS)) do_resize = true;
+    if (do_resize) {
+        ei::image::processing::crop_and_interpolate_rgb888(out_buf, EI_CAMERA_RAW_FRAME_BUFFER_COLS, EI_CAMERA_RAW_FRAME_BUFFER_ROWS, out_buf, img_width, img_height);
+    }
+    return true;
+}
+
+static int ei_camera_get_data(size_t offset, size_t length, float *out_ptr) {
+    size_t pixel_ix = offset * 3;
+    size_t pixels_left = length;
+    size_t out_ptr_ix = 0;
+    while (pixels_left != 0) {
+        out_ptr[out_ptr_ix] = (snapshot_buf[pixel_ix + 2] << 16) + (snapshot_buf[pixel_ix + 1] << 8) + snapshot_buf[pixel_ix];
+        out_ptr_ix++; pixel_ix+=3; pixels_left--;
+    }
+    return 0;
+}
