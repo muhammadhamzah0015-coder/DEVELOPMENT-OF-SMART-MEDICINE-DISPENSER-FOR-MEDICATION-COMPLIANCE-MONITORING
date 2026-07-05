@@ -29,8 +29,8 @@ const char* ssid = "";
 const char* password = "";
 
 // ===== TELEGRAM API SETTINGS =====
-String TELEGRAM_BOT_TOKEN = "8071110210:AAHya3vC7XQlzNKduBTdt28mTYRMQnWE21s";
-String TELEGRAM_CHAT_ID = "1081516566";
+String TELEGRAM_BOT_TOKEN = "";
+String TELEGRAM_CHAT_ID = "";
 
 // ===== ESP-NOW MAC ADDRESSES =====
 uint8_t aiAssistantAddress[] = {0xAC, 0xA7, 0x04, 0x26, 0x0B, 0xE0}; 
