@@ -1,0 +1,946 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <ArduinoASRChat.h>
+#include <ArduinoGPTChat.h>
+#include "Audio.h"
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <SPI.h>
+#include <time.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7735.h>
+#include <AccelStepper.h>
+#include <Preferences.h>  
+
+Preferences systemMemory; 
+
+// ===== TFT SCREEN SETTINGS (ADAFRUIT HARDWARE SPI) =====
+#define TFT_CS    21
+#define TFT_DC    38
+#define TFT_MOSI  14
+#define TFT_SCLK  13
+#define TFT_RST   8
+Adafruit_ST7735 tft = Adafruit_ST7735(&SPI, TFT_CS, TFT_DC, TFT_RST);
+
+unsigned long lastTftUpdate = 0; 
+int lastDrawnMinute = -1;  
+int lastDrawnState = -1;   
+
+String displayUserText = "...";
+String displayAIText = "...";
+bool lastDisplayModeEngaged = false;
+bool tftNeedsRedraw = true; 
+
+// ===== STEPPER MOTOR SETTINGS =====
+#define BOOT_BUTTON_PIN 48  
+
+const int motorPin1 = 9;
+const int motorPin2 = 10;
+const int motorPin3 = 11;
+const int motorPin4 = 12;
+AccelStepper medicineStepper(AccelStepper::HALF4WIRE, motorPin1, motorPin3, motorPin2, motorPin4);
+
+bool lastButtonState = LOW; 
+
+// ===== INTERNET TIME (GOOGLE NTP) SETTINGS =====
+const char* ntpServer = "time.google.com";
+const long  gmtOffset_sec = 28800;  // Malaysia UTC+8
+const int   daylightOffset_sec = 0;
+
+// ===== DOSAGE & REFILL TRACKING (PROTOTYPE VERSION) =====
+int dosesDispensed = 0; 
+const int MAX_DOSES = 4; // Prototype mode: 1 day only
+
+// Structure to hold the start and end times for each test dose
+struct DoseWindow {
+  int startHour;
+  int startMinute;
+  int endHour;
+  int endMinute;
+  bool alreadyTaken; 
+  bool missedAlertSent; // NEW: Tracks if caretaker was alerted
+};
+
+// --- SET YOUR TESTING TIMES HERE (24-Hour Format) ---
+DoseWindow prototypeSchedule[4] = {
+  {22, 00, 23,  00, false, false}, // Dose 1
+  {23, 11, 23,  13, false, false},  // Dose 2
+  {23,  23, 23,  16, false, false}, // Dose 3
+  {23,  17, 23,  20, false, false}   // Dose 4
+};
+
+bool isRefillMode = false;
+unsigned long buttonPressStartTime = 0;
+bool buttonIsBeingPressed = false;
+bool longPressTriggered = false;
+
+#define ENABLE_CONVERSATION_MEMORY 1
+
+#define I2S_DOUT 2
+#define I2S_BCLK 42
+#define I2S_LRC 41
+
+#define I2S_MIC_SERIAL_CLOCK 5    
+#define I2S_MIC_LEFT_RIGHT_CLOCK 4 
+#define I2S_MIC_SERIAL_DATA 6    
+
+// ===== 4-PIN ULTRASONIC SENSOR PINS =====
+const int trigPin = 7;  
+const int echoPin = 15; 
+
+// ===== TELEGRAM API SETTINGS (CARETAKER) =====
+String TELEGRAM_BOT_TOKEN = "8071110210:AAHya3vC7XQlzNKduBTdt28mTYRMQnWE21s";
+String TELEGRAM_CHAT_ID = "1081516566";
+
+// ===== SIGNAL API SETTINGS (PATIENT NOTIFICATION) =====
+String PATIENT_API_KEY = "117610";              
+String PATIENT_PHONE = "0672e32d-f44a-460d-a830-cd5be5da7c28"; 
+unsigned long lastPatientReminderTime = 0;
+
+// ===== ESP-NOW CONFIG =====
+uint8_t camAddress[] = {0x8C, 0x4F, 0x00, 0xAB, 0xC2, 0xBC};
+
+typedef struct struct_message {
+  bool isPresent;
+} struct_message;
+struct_message myData;
+
+typedef struct text_message {
+  char commandText[200];
+} text_message;
+text_message incomingCommand;
+
+esp_now_peer_info_t peerInfo;
+
+volatile bool newEspNowCommand = false;
+String pendingEspNowCommand = "";
+bool isWebsocketConnected = false;  
+bool patientAlreadyConfirmed = false;
+bool visualConfirmationReceived = false; // NEW: Remembers if the camera saw him
+bool patientEngaged = false;
+
+// ===== PATIENT PAUSE BUFFER VARIABLES =====
+String speechBuffer = "";
+unsigned long lastSpeechTime = 0;
+bool isBufferingSpeech = false;
+const unsigned long PATIENT_PAUSE_TIMEOUT = 2500;
+
+#define SAMPLE_RATE 16000
+
+// WiFi settings
+const char* ssid     = "Alhamdulillah";
+const char* password = "masyaAllah";
+
+// ByteDance & OpenAI API config
+const char* asr_api_key = "07fcb4a5-b7b2-45d8-864a-8cc0292380df";
+const char* asr_cluster = "volcengine_input_en";
+const char* openai_apiKey = "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";
+const char* openai_apiBaseUrl = "https://api.openai.com";
+
+// ========== Compliance Monitoring Assistant Prompt ==========
+const char* systemPrompt =
+"You are a polite, helpful, and friendly medical compliance assistant helping Abdullah (an elderly gentleman who sometimes forgets things) take his daily medicine. "
+"CRITICAL RULE: You MUST start EVERY single response with a status tag in brackets. "
+"1. Start with [WAITING] as your DEFAULT. Use this if he has NOT explicitly stated he swallowed the pills. If he just says 'hello', or answers a casual question (e.g., 'I am enjoying the day'), you MUST still use [WAITING]. "
+"2. Start with [CONFIRMED] ONLY when Abdullah explicitly states he took the medicine (e.g., 'I took it', 'Yes, swallowed', 'All done'). "
+"PERSONALITY & CONVERSATION RULES: "
+"- NEVER sound like a robot. DO NOT repeat the same phrase over and over. Keep your words to 5-10 words. You are a Smart Medicine Dispenser Assistant. "
+"- Be respectful and companionable, but focus on monitoring his medication compliance. "
+"- If he asks how to take it, explain: press the red button to rotate the tray, then take the medicine from the exposed compartment. "
+"- Weave the medicine reminder gently into the natural conversation. "
+"- Once he finally confirms verbally, thank him for staying compliant with his schedule and wish him a wonderful day.";
+
+Audio audio;
+ArduinoASRChat asrChat(asr_api_key, asr_cluster);
+ArduinoGPTChat gptChat(openai_apiKey, openai_apiBaseUrl);
+
+enum ConversationState {
+  STATE_IDLE,              
+  STATE_LISTENING,         
+  STATE_PROCESSING_LLM,    
+  STATE_PLAYING_TTS,       
+  STATE_WAIT_TTS_COMPLETE  
+};
+
+ConversationState currentState = STATE_IDLE;
+bool continuousMode = false;
+unsigned long ttsStartTime = 0;
+unsigned long ttsCheckTime = 0;
+
+bool lastPresenceState = false;
+int presenceCounter = 0;
+int absenceCounter = 0;
+const int requiredReadings = 2; 
+unsigned long lastSensorCheck = 0;
+
+void audio_eof_speech(const char* info) {
+  Serial.println("\n[TTS] Playback completed");
+}
+
+bool isAllowedTime() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo, 10)) { 
+    return true; 
+  }
+  
+  int currentMins = timeinfo.tm_hour * 60 + timeinfo.tm_min;
+  
+  for (int i = 0; i < MAX_DOSES; i++) {
+    int startMins = prototypeSchedule[i].startHour * 60 + prototypeSchedule[i].startMinute;
+    int endMins = prototypeSchedule[i].endHour * 60 + prototypeSchedule[i].endMinute;
+    
+    if (currentMins >= startMins && currentMins <= endMins) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void sendTelegramText(String message) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    WiFiClientSecure client;
+    client.setInsecure(); 
+    Serial.println("\n[TELEGRAM] Sending message to caretaker...");
+    String url = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/sendMessage";
+    http.begin(client, url);
+    http.addHeader("Content-Type", "application/json");
+    String jsonPayload = "{\"chat_id\":\"" + TELEGRAM_CHAT_ID + "\",\"text\":\"" + message + "\"}";
+    http.POST(jsonPayload);
+    http.end();
+  }
+}
+
+// ===== NEW HELPER: URL ENCODE FOR PATIENT MESSAGE =====
+String urlencode(String str) {
+    String encodedString="";
+    char c, code0, code1, code2;
+    for (int i =0; i < str.length(); i++){
+      c=str.charAt(i);
+      if (c == ' '){
+        encodedString+= '+';
+      } else if (isalnum(c)){
+        encodedString+=c;
+      } else{
+        code1=(c & 0xf)+'0';
+        if ((c & 0xf) >9){
+            code1=(c & 0xf) - 10 + 'A';
+        }
+        c=(c>>4)&0xf;
+        code0=c+'0';
+        if (c > 9){
+            code0=c - 10 + 'A';
+        }
+        code2='\0';
+        encodedString+='%';
+        encodedString+=code0;
+        encodedString+=code1;
+      }
+      yield();
+    }
+    return encodedString;
+}
+
+// ===== NEW HELPER: SEND PATIENT MESSAGE =====
+void sendPatientMessage(String message) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    Serial.println("\n[SIGNAL] Sending reminder to patient...");
+    String fullUrl = "https://api.callmebot.com/signal/send.php?phone=" + PATIENT_PHONE + "&apikey=" + PATIENT_API_KEY + "&text=" + urlencode(message);
+    http.begin(fullUrl);
+    http.GET(); 
+    http.end();
+  }
+}
+
+void OnDataSent(const esp_now_send_info_t *info, esp_now_send_status_t status) { }
+
+void OnDataRecv(const esp_now_recv_info_t * info, const uint8_t *incomingDataBytes, int len) {
+  memcpy(&incomingCommand, incomingDataBytes, sizeof(incomingCommand));
+  String receivedText = String(incomingCommand.commandText);
+  Serial.println("\n[ESP-NOW] Received from Camera: " + receivedText);
+  pendingEspNowCommand = receivedText;
+  newEspNowCommand = true;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n\n----- AI Assistant Node Starting -----");
+
+  systemMemory.begin("SMD_tracker", false); 
+  
+  dosesDispensed = systemMemory.getInt("doses", 0);
+  
+  for (int i = 0; i < MAX_DOSES; i++) {
+     String key = "dose" + String(i);
+     prototypeSchedule[i].alreadyTaken = systemMemory.getBool(key.c_str(), false);
+  }
+  
+  Serial.printf("\n[MEMORY] System Restored! Doses already used: %d/%d\n", dosesDispensed, MAX_DOSES);
+
+  pinMode(BOOT_BUTTON_PIN, INPUT_PULLDOWN);
+  medicineStepper.setMaxSpeed(1000.0);
+  medicineStepper.setAcceleration(500.0); 
+
+  SPI.begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS); 
+  tft.initR(INITR_GREENTAB);
+  tft.setRotation(1);
+  tft.fillScreen(ST7735_BLACK);
+  tft.setTextWrap(true); 
+  tft.setTextColor(ST7735_WHITE);
+  tft.setTextSize(1);
+  tft.setCursor(10, 50);
+  tft.print("Connecting Wi-Fi...");
+
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+  randomSeed(analogRead(0) + millis());
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print('.');
+  }
+  Serial.println("\nWiFi connected successfully!");
+
+  tft.fillScreen(ST7735_BLACK);
+  tft.setCursor(10, 50);
+  tft.print("Syncing Google Time...");
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+
+  struct tm timeinfo;
+  while (!getLocalTime(&timeinfo)) {
+    Serial.println("Waiting for internet time...");
+    delay(500);
+  }
+
+  tft.fillScreen(ST7735_BLACK);
+  
+  tft.setTextSize(5); 
+  tft.setTextColor(0x780F); 
+  tft.setCursor(44, 30); 
+  tft.print("SMD");
+
+  tft.setTextSize(1);
+  tft.setTextColor(ST7735_WHITE);
+  tft.setCursor(8, 75);
+  tft.print("Smart Medicine Dispenser");
+
+  delay(2500); 
+
+  tft.fillScreen(ST7735_BLACK);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+  } else {
+    esp_now_register_send_cb(OnDataSent);
+    esp_now_register_recv_cb(OnDataRecv); 
+    memcpy(peerInfo.peer_addr, camAddress, 6);
+    peerInfo.channel = 0;  
+    peerInfo.encrypt = false;
+    esp_now_add_peer(&peerInfo);
+  }
+  
+  audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
+  audio.setVolume(20);
+  audio.setConnectionTimeout(2000, 7200); 
+
+  gptChat.setSystemPrompt(systemPrompt);
+  gptChat.enableMemory(true);
+
+  if (!asrChat.initINMP441Microphone(I2S_MIC_SERIAL_CLOCK, I2S_MIC_LEFT_RIGHT_CLOCK, I2S_MIC_SERIAL_DATA)) return;
+
+  asrChat.setAudioParams(SAMPLE_RATE, 16, 1);
+  asrChat.setSilenceDuration(3000);  
+  asrChat.setMaxRecordingSeconds(50);
+
+  asrChat.setTimeoutNoSpeechCallback([]() {
+    if (continuousMode) stopContinuousMode(); 
+  });
+
+  if (!asrChat.connectWebSocket()) return;
+  isWebsocketConnected = true; 
+
+  Serial.println("\n----- System Ready -----");
+}
+
+void stopContinuousMode() {
+  continuousMode = false;
+  if (asrChat.isRecording()) asrChat.stopRecording();
+  asrChat.disconnectWebSocket();
+  isWebsocketConnected = false; 
+  currentState = STATE_IDLE;
+}
+
+void processTextToSpeech(String text) {
+  bool isCameraCommand = (text.indexOf("Command:") != -1 || text.indexOf("System Alert") != -1);
+  currentState = STATE_PROCESSING_LLM;
+  tftNeedsRedraw = true; 
+  Serial.println("\n[LLM] Sending to ChatGPT...");
+
+  String response = gptChat.sendMessage(text);
+
+  if (response != "" && response.length() > 0) {
+    Serial.println("\n=== ChatGPT Response ===");
+    Serial.printf("%s\n", response.c_str());
+
+    displayAIText = response; 
+    tftNeedsRedraw = true; 
+
+    if (response.indexOf("[CONFIRMED]") != -1) {
+      if (isCameraCommand) {
+          Serial.println("[SYSTEM] Hallucination BLOCKED.");
+      } else if (patientAlreadyConfirmed == false) {
+          
+        String confirmMsg = "";
+        
+        // Scenario 1: Visually AND Verbally Confirmed
+        if (visualConfirmationReceived == true) {
+            confirmMsg = "SUCCESS: The camera VISUALLY detected the action, and the patient VERBALLY confirmed. Progress: Dose " + String(dosesDispensed) + "/4.";
+        } 
+        // Scenario 2: Verbally Confirmed, but NO Visual
+        else {
+            confirmMsg = "PARTIAL CONFIRMATION: The patient VERBALLY confirmed taking the medicine, but the camera did NOT visually detect it. Progress: Dose " + String(dosesDispensed) + "/4.";
+        }
+        
+        sendTelegramText(confirmMsg);
+        
+        if (dosesDispensed >= MAX_DOSES) {
+            sendTelegramText("ALERT: All 4 doses have been consumed. The dispenser is now EMPTY and requires a refill.");
+        }
+        
+        patientAlreadyConfirmed = true; 
+      }
+    }
+
+    response.replace("[CONFIRMED]", "");
+    response.replace("[WAITING]", "");
+    response.trim(); 
+
+    currentState = STATE_PLAYING_TTS;
+    if (audio.isRunning()) audio.stopSong(); 
+    delay(500); 
+
+    if (gptChat.textToSpeech(response)) {
+      currentState = STATE_WAIT_TTS_COMPLETE;
+      ttsStartTime = millis();
+      ttsCheckTime = millis();
+    } else {
+      if (continuousMode) { delay(500); currentState = STATE_LISTENING; asrChat.connectWebSocket(); isWebsocketConnected = true; asrChat.startRecording(); }
+      else currentState = STATE_IDLE;
+    }
+  } else {
+    if (continuousMode) { delay(500); currentState = STATE_LISTENING; asrChat.connectWebSocket(); isWebsocketConnected = true; asrChat.startRecording(); }
+    else currentState = STATE_IDLE;
+  }
+}
+
+void handleASRResult() {
+  String transcribedText = asrChat.getRecognizedText();
+  asrChat.clearResult();
+
+  if (transcribedText.length() > 0) {
+    Serial.println("\n[ASR] Caught part of sentence: " + transcribedText);
+    speechBuffer += transcribedText + " ";
+    lastSpeechTime = millis();
+    isBufferingSpeech = true;
+
+    if (continuousMode) {
+      delay(50); 
+      asrChat.startRecording(); 
+    }
+  } else {
+    if (continuousMode && !isBufferingSpeech) { 
+      delay(500); 
+      currentState = STATE_LISTENING; 
+      asrChat.startRecording(); 
+    } else if (!isBufferingSpeech) {
+      currentState = STATE_IDLE;
+    }
+  }
+}
+
+void checkPatientPresence() {
+  long duration, cm;
+  digitalWrite(trigPin, LOW); delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH); delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  duration = pulseIn(echoPin, HIGH, 25000);
+  cm = (duration == 0) ? 999 : duration / 29 / 2;
+
+  if (cm > 0 && cm <= 50) { presenceCounter++; absenceCounter = 0; } 
+  else { absenceCounter++; presenceCounter = 0; }
+
+  bool currentPresenceState = lastPresenceState;
+  if (presenceCounter >= requiredReadings && lastPresenceState == false) currentPresenceState = true;
+  else if (absenceCounter >= requiredReadings && lastPresenceState == true) currentPresenceState = false;
+
+  if (currentPresenceState != lastPresenceState) {
+    myData.isPresent = currentPresenceState;
+    if (currentPresenceState == true) {
+      Serial.println("\n>>> ULTRASONIC TRIGGER: Waking up Camera via ESP-NOW <<<");
+      esp_now_send(camAddress, (uint8_t *) &myData, sizeof(myData));
+    } 
+    lastPresenceState = currentPresenceState;
+  }
+}
+
+// ===== NEW FUNCTION: CHECK SCHEDULE AND SEND MESSAGES =====
+void handleMedicationReminders() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return;
+
+  // --- NEW DAY RESET LOGIC ---
+  static int lastCheckedDay = systemMemory.getInt("currentDay", -1);
+  
+  if (lastCheckedDay != -1 && lastCheckedDay != timeinfo.tm_mday) {
+      Serial.println("\n[SYSTEM] A new day has started! Resetting daily doses...");
+      
+      dosesDispensed = 0;
+      systemMemory.putInt("doses", 0);
+      
+      for (int i = 0; i < MAX_DOSES; i++) {
+         prototypeSchedule[i].alreadyTaken = false; 
+         prototypeSchedule[i].missedAlertSent = false;
+         String key = "dose" + String(i);
+         systemMemory.putBool(key.c_str(), false); 
+      }
+      
+      sendTelegramText("SYSTEM UPDATE: A new day has started. All daily medication slots have been reset and are ready for the patient.");
+  }
+  
+  if (lastCheckedDay != timeinfo.tm_mday) {
+      lastCheckedDay = timeinfo.tm_mday;
+      systemMemory.putInt("currentDay", lastCheckedDay);
+  }
+  // ---------------------------
+
+  int currentMins = timeinfo.tm_hour * 60 + timeinfo.tm_min;
+  bool currentlyInAnyWindow = false;
+
+  for (int i = 0; i < MAX_DOSES; i++) {
+    int startMins = prototypeSchedule[i].startHour * 60 + prototypeSchedule[i].startMinute;
+    int endMins = prototypeSchedule[i].endHour * 60 + prototypeSchedule[i].endMinute;
+
+    if (currentMins >= startMins && currentMins <= endMins) {
+      currentlyInAnyWindow = true;
+
+      if (!prototypeSchedule[i].alreadyTaken && !patientEngaged) {
+        if (millis() - lastPatientReminderTime > 300000 || lastPatientReminderTime == 0) {
+          sendPatientMessage("Hello, it is time for your medicine. Please come to the dispenser.");
+          lastPatientReminderTime = millis();
+        }
+      }
+    }
+
+    if (currentMins > endMins && !prototypeSchedule[i].alreadyTaken && !prototypeSchedule[i].missedAlertSent) {
+       sendTelegramText("CRITICAL ALERT: The patient missed their medication time window for Dose " + String(i+1) + "! Please check on him immediately.");
+       prototypeSchedule[i].missedAlertSent = true;
+    }
+  }
+  
+  if (!currentlyInAnyWindow) {
+     lastPatientReminderTime = 0;
+  }
+}
+
+void loop() {
+  audio.loop();
+  
+  asrChat.loop();
+
+  handleMedicationReminders(); // <--- NEW: Checks schedule in the background
+
+  if (Serial.available() > 0) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    if (command == "RESET") {
+      Serial.println("\n[SYSTEM] Factory Reset Triggered via Serial!");
+      
+      systemMemory.clear(); 
+      dosesDispensed = 0;
+      for (int i = 0; i < MAX_DOSES; i++) {
+         prototypeSchedule[i].alreadyTaken = false; 
+         prototypeSchedule[i].missedAlertSent = false;
+      }
+      
+      Serial.println("[SYSTEM] Memory is completely clean. Starting fresh.");
+    }
+  }
+
+  if (isBufferingSpeech && (millis() - lastSpeechTime > PATIENT_PAUSE_TIMEOUT)) {
+    isBufferingSpeech = false; 
+    
+    Serial.println("\n=== Final Complete Sentence ===");
+    Serial.printf("%s\n", speechBuffer.c_str());
+    
+    if (asrChat.isRecording()) {
+      asrChat.stopRecording();
+    }
+    
+    Serial.println("[SYSTEM] Severing ASR connection to free up Wi-Fi for ChatGPT...");
+    asrChat.disconnectWebSocket();
+    isWebsocketConnected = false;
+    
+    displayUserText = speechBuffer;
+    displayAIText = "..."; 
+    tftNeedsRedraw = true;
+
+    processTextToSpeech(speechBuffer);
+    speechBuffer = ""; 
+  }
+
+  bool currentButtonState = digitalRead(BOOT_BUTTON_PIN);
+
+  if (currentButtonState == HIGH) {
+    
+    if (lastButtonState == LOW) {
+      buttonPressStartTime = millis();
+      buttonIsBeingPressed = true;
+      longPressTriggered = false; 
+    }
+
+    if (buttonIsBeingPressed && !longPressTriggered) {
+      if (millis() - buttonPressStartTime > 5000) {
+        longPressTriggered = true; 
+        isRefillMode = !isRefillMode;
+        
+        if (isRefillMode) {
+          Serial.println("\n[SYSTEM] Entered REFILL MODE.");
+          sendTelegramText("Caretaker entered REFILL MODE. Normal operation suspended.");
+          
+          int slotsToStart = 13 - dosesDispensed;
+          Serial.printf("[DISPENSER] Rotating %d slots to reach START position...\n", slotsToStart);
+          
+          medicineStepper.move(-2363 * slotsToStart);
+          while(medicineStepper.distanceToGo() != 0) {
+              medicineStepper.run();
+              yield(); 
+          }
+          
+          dosesDispensed = 0;
+          systemMemory.putInt("doses", 0); 
+          
+          for (int i = 0; i < MAX_DOSES; i++) {
+            prototypeSchedule[i].alreadyTaken = false; 
+            prototypeSchedule[i].missedAlertSent = false;
+            
+            String key = "dose" + String(i);
+            systemMemory.putBool(key.c_str(), false); 
+          }
+          
+          displayUserText = "[SYSTEM IN REFILL MODE]";
+          displayAIText = "Caretaker is refilling...";
+          tftNeedsRedraw = true;
+        } 
+        else {
+          Serial.println("\n[SYSTEM] Exited REFILL MODE.");
+          sendTelegramText("Refill complete. Dispenser is loaded and ready for patient.");
+          
+          displayUserText = "[REFILL COMPLETE]";
+          displayAIText = "System ready.";
+          tftNeedsRedraw = true;
+        }
+      }
+    }
+  } 
+  
+  else {
+    
+    if (buttonIsBeingPressed && lastButtonState == HIGH) {
+      unsigned long pressDuration = millis() - buttonPressStartTime;
+      
+      if (pressDuration < 5000 && pressDuration > 50 && !longPressTriggered) {
+        
+        if (isRefillMode) {
+          Serial.println("[DISPENSER] Button pressed, but system is in REFILL MODE. Ignored.");
+        } 
+        else if (dosesDispensed >= MAX_DOSES) {
+          Serial.println("\n[DISPENSER] Empty! Cannot dispense. Please refill.");
+          sendTelegramText("The patient tried to take medicine, but the dispenser is EMPTY!");
+          processTextToSpeech("System Alert: The dispenser is empty. Tell Abdullah to please wait while we contact the caretaker to refill the medicine.");
+        }
+        else {
+          
+          struct tm timeinfo;
+          if (!getLocalTime(&timeinfo)) {
+            Serial.println("Failed to get internet time! Cannot check schedule.");
+          } else {
+              int currentMins = timeinfo.tm_hour * 60 + timeinfo.tm_min;
+              int activeDoseIndex = -1; 
+              
+              for (int i = 0; i < MAX_DOSES; i++) {
+                int startMins = prototypeSchedule[i].startHour * 60 + prototypeSchedule[i].startMinute;
+                int endMins = prototypeSchedule[i].endHour * 60 + prototypeSchedule[i].endMinute;
+                
+                if (currentMins >= startMins && currentMins <= endMins) {
+                  activeDoseIndex = i;
+                  break; 
+                }
+              }
+
+              if (patientEngaged == true && activeDoseIndex != -1) {
+                
+                if (prototypeSchedule[activeDoseIndex].alreadyTaken == true) {
+                   Serial.println("\n[DISPENSER] Patient already took this dose! He tried ti take again, tell him to come back for next dose.");
+                   processTextToSpeech("System Alert: Tell Abdullah gently: 'You have already taken your medicine for this specific time slot. You do not need any more right now.'");
+                   
+                   displayUserText = "[Already Taken]";
+                   displayAIText = "Wait for next schedule.";
+                   tftNeedsRedraw = true;
+                } 
+                else {
+                   Serial.println("\n[DISPENSER] Valid button press! Dispensing medicine...");
+                   if (asrChat.isRecording()) { asrChat.stopRecording(); }
+
+                   prototypeSchedule[activeDoseIndex].alreadyTaken = true;
+                   String key = "dose" + String(activeDoseIndex);
+                   systemMemory.putBool(key.c_str(), true); 
+
+                   medicineStepper.move(-2363);
+                   while(medicineStepper.distanceToGo() != 0) {
+                      medicineStepper.run();
+                      yield(); 
+                   }
+                   
+                   dosesDispensed++; 
+                   systemMemory.putInt("doses", dosesDispensed); 
+
+                   Serial.printf("[DISPENSER] Tray opened. Dose %d of 4.\n", dosesDispensed);
+
+                    String dispenseMsg = "Tray opened. Dose " + String(dosesDispensed) + "/4 is now exposed. Waiting for patient to consume...";
+                    sendTelegramText(dispenseMsg);
+
+                   continuousMode = true; 
+                 
+                    Serial.println("[SYSTEM] Severing ASR connection to free up Wi-Fi for ChatGPT...");
+                    asrChat.disconnectWebSocket();
+                    isWebsocketConnected = false;
+                    
+                    String dispenseAlert = "System Alert: The patient pressed the button. Tell him directly: 'Abdullah, you have pressed the button. Please take your medicine from the exposed compartment.'";
+                    
+                    displayUserText = "[Dispensing: Dose " + String(dosesDispensed) + "]";
+                    displayAIText = "...";
+                    tftNeedsRedraw = true;
+                    
+                    processTextToSpeech(dispenseAlert);
+                }
+              } 
+              else if (patientEngaged == true && activeDoseIndex == -1) {
+                Serial.println("\n[DISPENSER] Button pressed outside scheduled time windows.");
+                
+                String waitMsg = "System Alert: Abdullah pressed the button, but it is not time for any of his doses. Tell him nicely to please check his schedule and come back later.";
+                
+                displayUserText = "[Wrong Time]";
+                displayAIText = "Not scheduled right now.";
+                tftNeedsRedraw = true;
+
+                processTextToSpeech(waitMsg);
+              }
+          }
+        }
+      }
+    }
+    
+    buttonIsBeingPressed = false;
+  }
+  
+  lastButtonState = currentButtonState;
+
+  if (newEspNowCommand) {
+    newEspNowCommand = false; 
+    String cmdToProcess = pendingEspNowCommand;
+    
+    // Check if the camera is sending a visual confirmation
+    if (cmdToProcess.indexOf("saw Abdullah pick up the pill") != -1) {
+        visualConfirmationReceived = true; 
+    }
+    
+    if (cmdToProcess == "SLEEP_ALL") {
+       Serial.println("\n>>> CAMERA SAID TO SLEEP. SHUTTING DOWN AI <<<");
+       Serial.flush();
+       
+       if (patientEngaged == true && patientAlreadyConfirmed == false) {
+           // Scenario 3: Visually Confirmed, but NOT Verbally Confirmed
+           if (visualConfirmationReceived == true) {
+               sendTelegramText("DISCREPANCY ALERT: The camera visually saw the patient take the medicine, but he walked away WITHOUT verbally confirming. Please check on him.");
+           } else {
+               sendTelegramText("ALERT: The patient left without taking or verbally confirming his medication.");
+           }
+       }
+       
+       patientAlreadyConfirmed = false; 
+       visualConfirmationReceived = false; // Reset for next time
+       patientEngaged = false; 
+       stopContinuousMode();
+    } 
+    else if (cmdToProcess.indexOf("left the presence") != -1 && patientAlreadyConfirmed == true) { 
+        Serial.println(">>> IGNORING WALK-AWAY ALARM: Patient already confirmed verbally. <<<");
+        Serial.flush();
+    } 
+    else {
+       patientEngaged = true; 
+       if (asrChat.isRecording()) asrChat.stopRecording();
+       continuousMode = true; 
+       
+       if (!isAllowedTime() && cmdToProcess.indexOf("presence") != -1) {
+           cmdToProcess = "System Command: The patient approached the dispenser, but it is currently outside his allowed medication time. Gently tell him it is not time for his medicine yet, and tell him to come back later.";
+       }
+       
+       displayUserText = "[Camera Detected Movement]";
+       displayAIText = "...";
+       tftNeedsRedraw = true;
+
+       Serial.println("[SYSTEM] Severing ASR connection to free up Wi-Fi for ChatGPT...");
+       asrChat.disconnectWebSocket();
+       isWebsocketConnected = false;
+
+       processTextToSpeech(cmdToProcess);
+    }
+  }
+
+  if (millis() - lastSensorCheck > 500) {
+    lastSensorCheck = millis();
+    if (!audio.isRunning()) checkPatientPresence();
+  }
+
+  switch (currentState) {
+    case STATE_IDLE: break;
+    case STATE_LISTENING: if (asrChat.hasNewResult()) handleASRResult(); break;
+    case STATE_PROCESSING_LLM: break;
+    case STATE_PLAYING_TTS: break;
+    case STATE_WAIT_TTS_COMPLETE:
+      if (millis() - ttsCheckTime > 100) {  
+        ttsCheckTime = millis();
+        
+        if (!audio.isRunning()) {
+          if (continuousMode) { 
+            currentState = STATE_LISTENING; 
+            
+            Serial.println("[SYSTEM] Giving Wi-Fi a moment to stabilize...");
+            
+            delay(1500); 
+            
+            Serial.println("[SYSTEM] Reconnecting ASR WebSocket after speech...");
+            
+            bool wsConnected = asrChat.connectWebSocket();
+            
+            if (!wsConnected) {
+                Serial.println("[WARNING] Handshake failed. Retrying in 1 second...");
+                delay(1000);
+                wsConnected = asrChat.connectWebSocket();
+            }
+            
+            if (wsConnected) {
+                isWebsocketConnected = true;
+                
+                if (!asrChat.startRecording()) {
+                    stopContinuousMode(); 
+                }
+            } else {
+                Serial.println("[ERROR] WebSocket handshake failed twice! Shutting down AI to prevent crash.");
+                stopContinuousMode();
+            }
+            
+          }
+          else {
+            currentState = STATE_IDLE;
+          }
+        } else {
+          if (millis() - ttsStartTime > 20000) {  
+            if (continuousMode) { 
+              currentState = STATE_LISTENING; 
+              asrChat.connectWebSocket(); 
+              asrChat.startRecording(); 
+            }
+            else currentState = STATE_IDLE;
+          }
+        }
+      }
+      break;
+  }
+
+  if (millis() - lastTftUpdate > 200) { 
+    lastTftUpdate = millis();
+
+    if (patientEngaged != lastDisplayModeEngaged) {
+        tft.fillScreen(ST7735_BLACK);
+        lastDisplayModeEngaged = patientEngaged;
+        lastDrawnMinute = -1;  
+        lastDrawnState = -1;   
+        tftNeedsRedraw = true; 
+    }
+
+    if (patientEngaged == false) {
+        struct tm timeinfo;
+        if (getLocalTime(&timeinfo, 10)) {
+          if (timeinfo.tm_min != lastDrawnMinute || tftNeedsRedraw) {
+            tft.fillScreen(ST7735_BLACK); 
+            
+            tft.setTextColor(ST7735_WHITE, ST7735_BLACK);
+            tft.setTextSize(3); 
+            tft.setCursor(10, 50); 
+            char timeStr[6];
+            sprintf(timeStr, "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+            tft.print(timeStr);
+
+            tft.setTextSize(1); 
+            tft.setCursor(10, 90);
+            tft.setTextColor(ST7735_YELLOW, ST7735_BLACK);
+            char dateStr[30];
+            strftime(dateStr, sizeof(dateStr), "%A, %d/%m/%Y", &timeinfo);
+            tft.print(dateStr);
+            
+            lastDrawnMinute = timeinfo.tm_min; 
+            tftNeedsRedraw = false;
+          }
+        }
+    } 
+    else {
+        if (currentState != lastDrawnState || tftNeedsRedraw) {
+            tft.fillScreen(ST7735_BLACK); 
+
+            tft.setCursor(0, 5);
+            tft.setTextSize(1);
+            if (currentState == STATE_LISTENING) {
+                tft.setTextColor(ST7735_GREEN, ST7735_BLACK);
+                tft.print("Status: Listening..."); 
+            } else if (currentState == STATE_PLAYING_TTS) {
+                tft.setTextColor(ST7735_CYAN, ST7735_BLACK);
+                tft.print("Status: Speaking...");
+            } else if (currentState == STATE_PROCESSING_LLM) {
+                tft.setTextColor(ST7735_MAGENTA, ST7735_BLACK);
+                tft.print("Status: Thinking...");
+            } else {
+                tft.setTextColor(ST7735_WHITE, ST7735_BLACK);
+                tft.print("Status: Standby");
+            }
+
+            tft.setCursor(0, 25);
+            tft.setTextColor(ST7735_YELLOW); 
+            tft.print("Abdullah Said:");
+            tft.setCursor(0, 35);
+            tft.setTextColor(ST7735_WHITE);
+            tft.print(displayUserText); 
+
+            tft.setCursor(0, 75);
+            tft.setTextColor(ST7735_CYAN); 
+            tft.print("Nurse AI:");
+            tft.setCursor(0, 85);
+            tft.setTextColor(ST7735_WHITE);
+            tft.print(displayAIText); 
+
+            lastDrawnState = currentState; 
+            tftNeedsRedraw = false;
+        }
+    }
+  }
+  
+  if (currentState == STATE_LISTENING || currentState == STATE_PLAYING_TTS) {
+      yield(); 
+  } else {
+      delay(5);
+  }
+}
