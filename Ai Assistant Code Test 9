@@ -89,12 +89,12 @@ const int trigPin = 7;
 const int echoPin = 15; 
 
 // ===== TELEGRAM API SETTINGS (CARETAKER) =====
-String TELEGRAM_BOT_TOKEN = "8071110210:AAHya3vC7XQlzNKduBTdt28mTYRMQnWE21s";
-String TELEGRAM_CHAT_ID = "1081516566";
+String TELEGRAM_BOT_TOKEN = "";
+String TELEGRAM_CHAT_ID = "";
 
 // ===== SIGNAL API SETTINGS (PATIENT NOTIFICATION) =====
-String PATIENT_API_KEY = "117610";              
-String PATIENT_PHONE = "0672e32d-f44a-460d-a830-cd5be5da7c28"; 
+String PATIENT_API_KEY = "";              
+String PATIENT_PHONE = ""; 
 unsigned long lastPatientReminderTime = 0;
 
 // ===== ESP-NOW CONFIG =====
@@ -128,13 +128,13 @@ const unsigned long PATIENT_PAUSE_TIMEOUT = 2500;
 #define SAMPLE_RATE 16000
 
 // WiFi settings
-const char* ssid     = "Alhamdulillah";
-const char* password = "masyaAllah";
+const char* ssid     = "";
+const char* password = "";
 
 // ByteDance & OpenAI API config
-const char* asr_api_key = "07fcb4a5-b7b2-45d8-864a-8cc0292380df";
+const char* asr_api_key = "";
 const char* asr_cluster = "volcengine_input_en";
-const char* openai_apiKey = "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";
+const char* openai_apiKey = "";
 const char* openai_apiBaseUrl = "https://api.openai.com";
 
 // ========== Compliance Monitoring Assistant Prompt ==========
