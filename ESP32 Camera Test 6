@@ -33,7 +33,7 @@ String TELEGRAM_BOT_TOKEN = "";
 String TELEGRAM_CHAT_ID = "";
 
 // ===== ESP-NOW MAC ADDRESSES =====
-uint8_t aiAssistantAddress[] = {0xAC, 0xA7, 0x04, 0x26, 0x0B, 0xE0}; 
+uint8_t aiAssistantAddress[] = {0x, 0x, 0x, 0x, 0x, 0x}; 
 
 // ===== EVENT COUNTERS & FLAGS =====
 int presence_count = 0;
